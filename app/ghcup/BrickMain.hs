@@ -25,6 +25,7 @@ import           Brick
 import           Brick.Widgets.Border
 import           Brick.Widgets.Border.Style
 import           Brick.Widgets.Center
+import           Brick.Widgets.Dialog (Dialog, dialog, renderDialog, handleDialogEvent, buttonSelectedAttr, dialogSelection)
 import           Brick.Widgets.List             ( listSelectedFocusedAttr
                                                 , listSelectedAttr
                                                 , listAttr
@@ -45,7 +46,7 @@ import           Data.IORef
 import           Data.Vector                    ( Vector
                                                 , (!?)
                                                 )
-import           Data.Versions           hiding ( str )
+import           Data.Versions           hiding ( str, Lens' )
 import           Haskus.Utils.Variant.Excepts
 import           Prelude                 hiding ( appendFile )
 import           System.FilePath
@@ -61,7 +62,7 @@ import qualified Graphics.Vty                  as Vty
 import qualified Data.Vector                   as V
 import System.Environment (getExecutablePath)
 import qualified System.Posix.Process          as SPP
-
+import qualified Lens.Micro as Micro
 
 hiddenTools :: [Tool]
 hiddenTools = []
@@ -76,13 +77,16 @@ data BrickSettings = BrickSettings
   { showAllVersions    :: Bool
   , showAllTools       :: Bool
   }
-  deriving Show
+  --deriving Show
+
+data PopUp = PopUp {isVisible :: Bool, popUpDialog :: Dialog Bool String, selectedValue :: Maybe Bool}
 
 data BrickInternalState = BrickInternalState
-  { clr :: Vector ListResult
-  , ix  :: Int
+  { clr   :: Vector ListResult
+  , ix    :: Int
+  , popUp :: PopUp
   }
-  deriving Show
+  --deriving Show
 
 data BrickState = BrickState
   { appData     :: BrickData
@@ -90,7 +94,26 @@ data BrickState = BrickState
   , appState    :: BrickInternalState
   , appKeys     :: KeyBindings
   }
-  deriving Show
+  --deriving Show
+
+popUpL :: Micro.Lens' BrickState (Dialog Bool String)
+popUpL = Micro.lens
+          (popUpDialog . popUp . appState)
+          (\(BrickState {appState = BrickInternalState {popUp = PopUp {..}, ..}, ..}) dg -> BrickState{appState = BrickInternalState{popUp = PopUp {popUpDialog=dg, ..}, ..}, ..} )
+
+isPopUpVisible :: BrickState -> Bool
+isPopUpVisible (BrickState _ _ (BrickInternalState _ _ popup) _) = isVisible popup
+
+updateWithSelection :: BrickState -> BrickState
+updateWithSelection BrickState{appState=BrickInternalState{popUp = PopUp _ d _, ..},..} 
+  = BrickState{appState=BrickInternalState{popUp = PopUp False d (snd <$> dialogSelection d),..},..}
+
+makePopUpVisible :: BrickState -> BrickState
+makePopUpVisible BrickState{appState=BrickInternalState{popUp = PopUp _ b c, ..},..} 
+  = BrickState{appState=BrickInternalState{popUp = PopUp True b c,..},..}
+
+viewSelection :: BrickState -> Bool
+viewSelection = fromMaybe False . selectedValue . popUp . appState
 
 
 keyHandlers :: KeyBindings
@@ -101,7 +124,7 @@ keyHandlers :: KeyBindings
                ]
 keyHandlers KeyBindings {..} =
   [ (bQuit, const "Quit"     , \_ -> halt)
-  , (bInstall, const "Install"  , withIOAction install')
+  , (bInstall, const "Install"  , \_ -> modify makePopUpVisible)
   , (bUninstall, const "Uninstall", withIOAction del')
   , (bSet, const "Set"      , withIOAction set')
   , (bChangelog, const "ChangeLog", withIOAction changelog')
@@ -131,6 +154,15 @@ showKey Vty.KUp = "↑"
 showKey Vty.KDown = "↓"
 showKey key = tail (show key)
 
+-- | This is the Dialog. It includes only the buttons, their labels, and bounded values
+afterInstallPopUp :: PopUp 
+afterInstallPopUp = PopUp False yes_no_dialog Nothing
+  where yes_no_dialog = dialog Nothing (Just ("YesButton", [("Yes", "YesButton", True), ("No", "NoButton", False)])) 40
+
+-- | This is used to render the dialog, if it exists, else, just draw nothing 
+renderPopUp :: PopUp  -> Widget String
+renderPopUp (PopUp False _ _) = emptyWidget
+renderPopUp (PopUp True d _)  = renderDialog d (txtWrap "Do you want to set the installed tool as the default?")
 
 ui :: AttrMap -> BrickState -> Widget String
 ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
@@ -234,7 +266,7 @@ ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
                    -> Bool
                    -> BrickInternalState
                    -> Widget String
-  drawListElements drawElem foc is@(BrickInternalState clr _) =
+  drawListElements drawElem foc is@(BrickInternalState clr _ _) =
     Widget Greedy Greedy $
       let
         es = clr
@@ -263,10 +295,9 @@ ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
 minHSize :: Int -> Widget n -> Widget n
 minHSize s' = hLimit s' . vLimit 1 . (<+> fill ' ')
 
-
 app :: AttrMap -> AttrMap -> App BrickState e String
 app attrs dimAttrs =
-  App { appDraw         = \st -> [ui dimAttrs st]
+  App { appDraw     = \st -> [renderPopUp (popUp . appState $ st), ui dimAttrs st]
   , appHandleEvent  = \be -> get >>= \s -> eventHandler s be
   , appStartEvent   = return ()
   , appAttrMap      = const attrs
@@ -292,6 +323,7 @@ defaultAttributes no_color = attrMap
   , (attrName "day"               , Vty.defAttr `withForeColor` Vty.blue)
   , (attrName "help"              , Vty.defAttr `withStyle`     Vty.italic)
   , (attrName "hooray"            , Vty.defAttr `withForeColor` Vty.brightWhite)
+  , (buttonSelectedAttr           , Vty.defAttr `withBackColor` Vty.brightWhite)
   ]
   where
     withForeColor | no_color  = const
@@ -320,6 +352,8 @@ eventHandler st@BrickState{..} ev = do
       put (BrickState { appState = moveCursor 1 appState Up, .. })
     (MouseDown _ Vty.BScrollDown _ _) ->
       put (BrickState { appState = moveCursor 1 appState Down, .. })
+    (VtyEvent (Vty.EvKey Vty.KEnter [])) | isPopUpVisible st -> modify updateWithSelection >> (gets viewSelection >>= \isSet -> installAndSet isSet st)
+    (VtyEvent e)                         | isPopUpVisible st -> zoom popUpL (handleDialogEvent e)
     (VtyEvent (Vty.EvResize _ _)) -> put st
     (VtyEvent (Vty.EvKey Vty.KUp _)) ->
       put BrickState{ appState = moveCursor 1 appState Up, .. }
@@ -408,7 +442,7 @@ replaceLR filterF lr s =
         case oldElem >>= \(_, oldE) -> V.findIndex (toolEqual oldE) newVec of
           Just ix -> ix
           Nothing -> selectLatest newVec
-  in  BrickInternalState newVec newSelected
+  in  BrickInternalState newVec newSelected afterInstallPopUp
  where
   toolEqual e1 e2 =
     lTool e1 == lTool e2 && lVer e1 == lVer e2 && lCross e1 == lCross e2
@@ -431,6 +465,12 @@ filterVisible v t e | lInstalled e = True
                                   (Nightly `notElem` lTag e)   &&
                                   (lTool e `notElem` hiddenTools)
 
+
+installAndSet :: Bool -> BrickState -> EventM String BrickState ()
+
+installAndSet b brickstate = do 
+  withIOAction install' brickstate
+  when b (get >>= withIOAction set')
 
 install' :: (MonadReader AppState m, MonadIO m, MonadThrow m, MonadFail m, MonadMask m, MonadUnliftIO m)
          => BrickState
@@ -616,7 +656,6 @@ settings' = unsafePerformIO $ do
                       (GHCupInfo mempty mempty mempty)
                       (PlatformRequest A_64 Darwin Nothing)
                       loggerConfig
-
 
 
 brickMain :: AppState

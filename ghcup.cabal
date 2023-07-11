@@ -352,6 +352,7 @@ executable ghcup
       , transformers  ^>=0.5
       , unix          ^>=2.7
       , vty           ^>=5.37
+      , microlens     ^>=0.4.13
 
   if os(windows)
     cpp-options: -DIS_WINDOWS
