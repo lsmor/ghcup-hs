@@ -5,6 +5,7 @@
 {-# LANGUAGE TypeApplications  #-}
 {-# LANGUAGE RankNTypes        #-}
 {-# LANGUAGE ViewPatterns      #-}
+{-# LANGUAGE TemplateHaskell   #-}
 
 module BrickMain where
 
@@ -25,7 +26,7 @@ import           Brick
 import           Brick.Widgets.Border
 import           Brick.Widgets.Border.Style
 import           Brick.Widgets.Center
-import           Brick.Widgets.Dialog (Dialog, dialog, renderDialog, handleDialogEvent, buttonSelectedAttr, dialogSelection)
+import           Brick.Widgets.Dialog (buttonSelectedAttr)
 import           Brick.Widgets.List             ( listSelectedFocusedAttr
                                                 , listSelectedAttr
                                                 , listAttr
@@ -42,7 +43,7 @@ import           Data.Bool
 import           Data.Functor
 import           Data.List
 import           Data.Maybe
-import           Data.IORef
+import           Data.IORef (IORef, readIORef, newIORef, writeIORef, modifyIORef)
 import           Data.Vector                    ( Vector
                                                 , (!?)
                                                 )
@@ -62,90 +63,84 @@ import qualified Graphics.Vty                  as Vty
 import qualified Data.Vector                   as V
 import System.Environment (getExecutablePath)
 import qualified System.Posix.Process          as SPP
-import qualified Lens.Micro as Micro
+import Lens.Micro.TH (makeLenses)
+import Lens.Micro.Mtl ( (.=), use, (%=), view )
+import Lens.Micro ((.~), (&))
 
 hiddenTools :: [Tool]
-hiddenTools = []
-
+hiddenTools = [] 
 
 data BrickData = BrickData
-  { lr    :: [ListResult]
+  { _lr    :: [ListResult]
   }
   deriving Show
 
+makeLenses ''BrickData
+
 data BrickSettings = BrickSettings
-  { showAllVersions    :: Bool
-  , showAllTools       :: Bool
+  { _showAllVersions    :: Bool
+  , _showAllTools       :: Bool
   }
   --deriving Show
 
-data PopUp = PopUp {isVisible :: Bool, popUpDialog :: Dialog Bool String, selectedValue :: Maybe Bool}
+makeLenses ''BrickSettings
 
 data BrickInternalState = BrickInternalState
-  { clr   :: Vector ListResult
-  , ix    :: Int
-  , popUp :: PopUp
+  { _clr   :: Vector ListResult
+  , _ix    :: Int
   }
   --deriving Show
+
+makeLenses ''BrickInternalState
 
 data BrickState = BrickState
-  { appData     :: BrickData
-  , appSettings :: BrickSettings
-  , appState    :: BrickInternalState
-  , appKeys     :: KeyBindings
+  { _appData     :: BrickData
+  , _appSettings :: BrickSettings
+  , _appState    :: BrickInternalState
+  , _appKeys     :: KeyBindings
   }
   --deriving Show
 
-popUpL :: Micro.Lens' BrickState (Dialog Bool String)
-popUpL = Micro.lens
-          (popUpDialog . popUp . appState)
-          (\(BrickState {appState = BrickInternalState {popUp = PopUp {..}, ..}, ..}) dg -> BrickState{appState = BrickInternalState{popUp = PopUp {popUpDialog=dg, ..}, ..}, ..} )
-
-isPopUpVisible :: BrickState -> Bool
-isPopUpVisible (BrickState _ _ (BrickInternalState _ _ popup) _) = isVisible popup
-
-updateWithSelection :: BrickState -> BrickState
-updateWithSelection BrickState{appState=BrickInternalState{popUp = PopUp _ d _, ..},..} 
-  = BrickState{appState=BrickInternalState{popUp = PopUp False d (snd <$> dialogSelection d),..},..}
-
-makePopUpVisible :: BrickState -> BrickState
-makePopUpVisible BrickState{appState=BrickInternalState{popUp = PopUp _ b c, ..},..} 
-  = BrickState{appState=BrickInternalState{popUp = PopUp True b c,..},..}
-
-viewSelection :: BrickState -> Bool
-viewSelection = fromMaybe False . selectedValue . popUp . appState
-
+makeLenses ''BrickState
 
 keyHandlers :: KeyBindings
             -> [ ( Vty.Key
                  , BrickSettings -> String
-                 , BrickState -> EventM String BrickState ()
+                 , EventM String BrickState ()
                  )
                ]
 keyHandlers KeyBindings {..} =
-  [ (bQuit, const "Quit"     , \_ -> halt)
-  , (bInstall, const "Install"  , \_ -> modify makePopUpVisible)
+  [ (bQuit, const "Quit"     , halt)
+  , (bInstall, const "Install"  , withIOAction install')
   , (bUninstall, const "Uninstall", withIOAction del')
   , (bSet, const "Set"      , withIOAction set')
   , (bChangelog, const "ChangeLog", withIOAction changelog')
   , ( bShowAllVersions
     , \BrickSettings {..} ->
-       if showAllVersions then "Don't show all versions" else "Show all versions"
-    , hideShowHandler (not . showAllVersions) showAllTools
+       if _showAllVersions then "Don't show all versions" else "Show all versions"
+    , hideShowHandler' (not . _showAllVersions) _showAllTools
     )
   , ( bShowAllTools
     , \BrickSettings {..} ->
-       if showAllTools then "Don't show all tools" else "Show all tools"
-    , hideShowHandler showAllVersions (not . showAllTools)
+       if _showAllTools then "Don't show all tools" else "Show all tools"
+    , hideShowHandler' _showAllVersions (not . _showAllTools)
     )
-  , (bUp, const "Up", \BrickState {..} -> put BrickState{ appState = moveCursor 1 appState Up, .. })
-  , (bDown, const "Down", \BrickState {..} -> put BrickState{ appState = moveCursor 1 appState Down, .. })
+  , (bUp, const "Up", appState %= moveCursor 1 Up)
+  , (bDown, const "Down", appState %= moveCursor 1 Down)
   ]
  where
-  hideShowHandler f p BrickState{..} =
-    let newAppSettings   = appSettings { showAllVersions = f appSettings , showAllTools = p appSettings }
-        newInternalState = constructList appData newAppSettings (Just appState)
-    in  put (BrickState appData newAppSettings newInternalState appKeys)
+  --hideShowHandler' :: (BrickSettings -> Bool) -> (BrickSettings -> Bool) -> m ()
+  hideShowHandler' f p = do 
+    app_settings <- use appSettings
+    let 
+      vers = f app_settings
+      tools = p app_settings
+      newAppSettings = app_settings & showAllVersions .~ vers & showAllTools .~ tools
+    ad <- use appData
+    current_app_state <- use appState
+    appSettings .= newAppSettings
+    appState    .= constructList ad app_settings (Just current_app_state)
+
 
 
 showKey :: Vty.Key -> String
@@ -154,22 +149,12 @@ showKey Vty.KUp = "↑"
 showKey Vty.KDown = "↓"
 showKey key = tail (show key)
 
--- | This is the Dialog. It includes only the buttons, their labels, and bounded values
-afterInstallPopUp :: PopUp 
-afterInstallPopUp = PopUp False yes_no_dialog Nothing
-  where yes_no_dialog = dialog Nothing (Just ("YesButton", [("Yes", "YesButton", True), ("No", "NoButton", False)])) 40
-
--- | This is used to render the dialog, if it exists, else, just draw nothing 
-renderPopUp :: PopUp  -> Widget String
-renderPopUp (PopUp False _ _) = emptyWidget
-renderPopUp (PopUp True d _)  = renderDialog d (txtWrap "Do you want to set the installed tool as the default?")
-
 ui :: AttrMap -> BrickState -> Widget String
-ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
+ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
   = padBottom Max
       ( withBorderStyle unicode
         $ borderWithLabel (str "GHCup")
-          (center (header <=> hBorder <=> renderList' appState))
+          (center (header <=> hBorder <=> renderList' _appState))
       )
     <=> footer
 
@@ -180,7 +165,7 @@ ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
       . T.pack
       . foldr1 (\x y -> x <> "  " <> y)
       . fmap (\(key, s, _) -> showKey key <> ":" <> s as)
-      $ keyHandlers appKeys
+      $ keyHandlers _appKeys
   header =
     minHSize 2 emptyWidget
       <+> padLeft (Pad 2) (minHSize 6 $ str "Tool")
@@ -188,8 +173,8 @@ ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
       <+> padLeft (Pad 1) (minHSize 25 $ str "Tags")
       <+> padLeft (Pad 5) (str "Notes")
   renderList' bis@BrickInternalState{..} =
-    let minTagSize = V.maximum $ V.map (length . intercalate "," . fmap tagToString . lTag) clr
-        minVerSize = V.maximum $ V.map (\ListResult{..} -> T.length $ tVerToText (GHCTargetVersion lCross lVer)) clr
+    let minTagSize = V.maximum $ V.map (length . intercalate "," . fmap tagToString . lTag) _clr
+        minVerSize = V.maximum $ V.map (\ListResult{..} -> T.length $ tVerToText (GHCTargetVersion lCross lVer)) _clr
     in withDefAttr listAttr . drawListElements (renderItem minTagSize minVerSize) True $ bis
   renderItem minTagSize minVerSize _ b listResult@ListResult{lTag = lTag', ..} =
     let marks = if
@@ -266,7 +251,7 @@ ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
                    -> Bool
                    -> BrickInternalState
                    -> Widget String
-  drawListElements drawElem foc is@(BrickInternalState clr _ _) =
+  drawListElements drawElem foc is@(BrickInternalState clr _) =
     Widget Greedy Greedy $
       let
         es = clr
@@ -295,10 +280,10 @@ ui dimAttrs BrickState{ appSettings = as@BrickSettings{}, ..}
 minHSize :: Int -> Widget n -> Widget n
 minHSize s' = hLimit s' . vLimit 1 . (<+> fill ' ')
 
-app :: AttrMap -> AttrMap -> App BrickState e String
+app :: AttrMap -> AttrMap -> App BrickState () String
 app attrs dimAttrs =
-  App { appDraw     = \st -> [renderPopUp (popUp . appState $ st), ui dimAttrs st]
-  , appHandleEvent  = \be -> get >>= \s -> eventHandler s be
+  App { appDraw     = \st -> [ui dimAttrs st]
+  , appHandleEvent  = eventHandler
   , appStartEvent   = return ()
   , appAttrMap      = const attrs
   , appChooseCursor = showFirstCursor
@@ -344,58 +329,51 @@ dimAttributes no_color = attrMap
     withBackColor | no_color  = \attr _ -> attr `Vty.withStyle` Vty.reverseVideo
                   | otherwise = Vty.withBackColor
 
-eventHandler :: BrickState -> BrickEvent String e -> EventM String BrickState ()
-eventHandler st@BrickState{..} ev = do
+eventHandler :: BrickEvent String e -> EventM String BrickState ()
+eventHandler ev = do
   AppState { keyBindings = kb } <- liftIO $ readIORef settings'
   case ev of
-    (MouseDown _ Vty.BScrollUp _ _) ->
-      put (BrickState { appState = moveCursor 1 appState Up, .. })
-    (MouseDown _ Vty.BScrollDown _ _) ->
-      put (BrickState { appState = moveCursor 1 appState Down, .. })
-    (VtyEvent (Vty.EvKey Vty.KEnter [])) | isPopUpVisible st -> modify updateWithSelection >> (gets viewSelection >>= \isSet -> installAndSet isSet st)
-    (VtyEvent e)                         | isPopUpVisible st -> zoom popUpL (handleDialogEvent e)
-    (VtyEvent (Vty.EvResize _ _)) -> put st
-    (VtyEvent (Vty.EvKey Vty.KUp _)) ->
-      put BrickState{ appState = moveCursor 1 appState Up, .. }
-    (VtyEvent (Vty.EvKey Vty.KDown _)) ->
-      put BrickState{ appState = moveCursor 1 appState Down, .. }
+    (MouseDown _ Vty.BScrollUp _ _) -> appState %= moveCursor 1 Up
+    (MouseDown _ Vty.BScrollDown _ _) -> appState %= moveCursor 1 Down
+    (VtyEvent (Vty.EvResize _ _)) -> pure ()
+    (VtyEvent (Vty.EvKey Vty.KUp _)) -> appState %= moveCursor 1 Up
+    (VtyEvent (Vty.EvKey Vty.KDown _)) -> appState %= moveCursor 1 Down
     (VtyEvent (Vty.EvKey key _)) ->
       case find (\(key', _, _) -> key' == key) (keyHandlers kb) of
-        Nothing -> put st
-        Just (_, _, handler) -> handler st
-    _ -> put st
+        Nothing -> pure ()
+        Just (_, _, handler) -> handler
+    _ -> pure ()
 
 
-moveCursor :: Int -> BrickInternalState -> Direction -> BrickInternalState
-moveCursor steps ais@BrickInternalState{..} direction =
-  let newIx = if direction == Down then ix + steps else ix - steps
-  in  case clr !? newIx of
-        Just _  -> BrickInternalState { ix = newIx, .. }
+moveCursor :: Int -> Direction -> BrickInternalState -> BrickInternalState
+moveCursor steps direction ais@BrickInternalState{..} =
+  let newIx = if direction == Down then _ix + steps else _ix - steps
+  in  case _clr !? newIx of
+        Just _  -> ais & ix .~ newIx
         Nothing -> ais
 
 
 -- | Suspend the current UI and run an IO action in terminal. If the
 -- IO action returns a Left value, then it's thrown as userError.
 withIOAction :: Ord n
-             => (BrickState
-                 -> (Int, ListResult)
-                 -> ReaderT AppState IO (Either String a))
-             -> BrickState
+             => ( (Int, ListResult) -> ReaderT AppState IO (Either String a))
              -> EventM n BrickState ()
-withIOAction action as = case listSelectedElement' (appState as) of
-  Nothing      -> put as
-  Just (ix, e) -> do
-    suspendAndResume $ do
-      settings <- readIORef settings'
-      flip runReaderT settings $ action as (ix, e) >>= \case
-        Left  err -> liftIO $ putStrLn ("Error: " <> err)
-        Right _   -> liftIO $ putStrLn "Success"
-      getAppData Nothing >>= \case
-        Right data' -> do
-          putStrLn "Press enter to continue"
-          _ <- getLine
-          pure (updateList data' as)
-        Left err -> throwIO $ userError err
+withIOAction action = do
+  as <- get
+  case listSelectedElement' (view appState as) of
+    Nothing      -> pure ()
+    Just (curr_ix, e) -> do
+      suspendAndResume $ do
+        settings <- readIORef settings'
+        flip runReaderT settings $ action (curr_ix, e) >>= \case
+          Left  err -> liftIO $ putStrLn ("Error: " <> err)
+          Right _   -> liftIO $ putStrLn "Success"
+        getAppData Nothing >>= \case
+          Right data' -> do
+            putStrLn "Press enter to continue"
+            _ <- getLine
+            pure (updateList data' as)
+          Left err -> throwIO $ userError err
 
 
 -- | Update app data and list internal state based on new evidence.
@@ -403,11 +381,11 @@ withIOAction action as = case listSelectedElement' (appState as) of
 -- and @BrickSettings@.
 updateList :: BrickData -> BrickState -> BrickState
 updateList appD BrickState{..} =
-  let newInternalState = constructList appD appSettings (Just appState)
-  in  BrickState { appState    = newInternalState
-                 , appData     = appD
-                 , appSettings = appSettings
-                 , appKeys     = appKeys
+  let newInternalState = constructList appD _appSettings (Just _appState)
+  in  BrickState { _appState    = newInternalState
+                 , _appData     = appD
+                 , _appSettings = _appSettings
+                 , _appKeys     = _appKeys
                  }
 
 
@@ -416,12 +394,12 @@ constructList :: BrickData
               -> Maybe BrickInternalState
               -> BrickInternalState
 constructList appD appSettings =
-  replaceLR (filterVisible (showAllVersions appSettings)
-                           (showAllTools appSettings))
-            (lr appD)
+  replaceLR (filterVisible (_showAllVersions appSettings)
+                           (_showAllTools appSettings))
+            (_lr appD)
 
 listSelectedElement' :: BrickInternalState -> Maybe (Int, ListResult)
-listSelectedElement' BrickInternalState{..} = fmap (ix, ) $ clr !? ix
+listSelectedElement' BrickInternalState{..} = fmap (_ix, ) $ _clr !? _ix
 
 
 selectLatest :: Vector ListResult -> Int
@@ -442,7 +420,7 @@ replaceLR filterF lr s =
         case oldElem >>= \(_, oldE) -> V.findIndex (toolEqual oldE) newVec of
           Just ix -> ix
           Nothing -> selectLatest newVec
-  in  BrickInternalState newVec newSelected afterInstallPopUp
+  in  BrickInternalState newVec newSelected
  where
   toolEqual e1 e2 =
     lTool e1 == lTool e2 && lVer e1 == lVer e2 && lCross e1 == lCross e2
@@ -466,17 +444,10 @@ filterVisible v t e | lInstalled e = True
                                   (lTool e `notElem` hiddenTools)
 
 
-installAndSet :: Bool -> BrickState -> EventM String BrickState ()
-
-installAndSet b brickstate = do 
-  withIOAction install' brickstate
-  when b (get >>= withIOAction set')
-
 install' :: (MonadReader AppState m, MonadIO m, MonadThrow m, MonadFail m, MonadMask m, MonadUnliftIO m)
-         => BrickState
-         -> (Int, ListResult)
+         => (Int, ListResult)
          -> m (Either String ())
-install' _ (_, ListResult {..}) = do
+install' (_, ListResult {..}) = do
   AppState { ghcupInfo = GHCupInfo { _ghcupDownloads = dls }} <- ask
 
   let run =
@@ -550,10 +521,9 @@ install' _ (_, ListResult {..}) = do
 
 
 set' :: (MonadReader AppState m, MonadIO m, MonadThrow m, MonadFail m, MonadMask m, MonadUnliftIO m)
-     => BrickState
-     -> (Int, ListResult)
+     => (Int, ListResult)
      -> m (Either String ())
-set' bs input@(_, ListResult {..}) = do
+set' input@(_, ListResult {..}) = do
   settings <- liftIO $ readIORef settings'
 
   let run =
@@ -575,12 +545,12 @@ set' bs input@(_, ListResult {..}) = do
               promptAnswer <- getUserPromptResponse userPrompt
               case promptAnswer of
                 PromptYes -> do
-                  res <- install' bs input
+                  res <- install' input
                   case res of
                     (Left err) -> pure $ Left err
                     (Right _) -> do
                       logInfo "Setting now..."
-                      set' bs input
+                      set' input
 
                 PromptNo -> pure $ Left (prettyHFError e)
               where
@@ -595,10 +565,9 @@ set' bs input@(_, ListResult {..}) = do
 
 
 del' :: (MonadReader AppState m, MonadIO m, MonadFail m, MonadMask m, MonadUnliftIO m)
-     => BrickState
-     -> (Int, ListResult)
+     => (Int, ListResult)
      -> m (Either String ())
-del' _ (_, ListResult {..}) = do
+del' (_, ListResult {..}) = do
   AppState { ghcupInfo = GHCupInfo { _ghcupDownloads = dls }} <- ask
 
   let run = runE @'[NotInstalled, UninstallFailed]
@@ -622,10 +591,9 @@ del' _ (_, ListResult {..}) = do
 
 
 changelog' :: (MonadReader AppState m, MonadIO m)
-           => BrickState
-           -> (Int, ListResult)
+           => (Int, ListResult)
            -> m (Either String ())
-changelog' _ (_, ListResult {..}) = do
+changelog' (_, ListResult {..}) = do
   AppState { pfreq, ghcupInfo = GHCupInfo { _ghcupDownloads = dls }} <- ask
   case getChangeLog dls lTool (ToolVersion lVer) of
     Nothing -> pure $ Left $
@@ -681,7 +649,7 @@ brickMain s = do
 
 
 defaultAppSettings :: BrickSettings
-defaultAppSettings = BrickSettings { showAllVersions = False, showAllTools = False }
+defaultAppSettings = BrickSettings { _showAllVersions = False, _showAllTools = False }
 
 
 getGHCupInfo :: IO (Either String GHCupInfo)
@@ -708,3 +676,4 @@ getAppData mgi = runExceptT $ do
   flip runReaderT settings $ do
     lV <- listVersions Nothing [] False True (Nothing, Nothing)
     pure $ BrickData (reverse lV)
+

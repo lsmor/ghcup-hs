@@ -353,6 +353,8 @@ executable ghcup
       , unix          ^>=2.7
       , vty           ^>=5.37
       , microlens     ^>=0.4.13
+      , microlens-th  ^>=0.4.3
+      , microlens-mtl ^>=0.2.0
 
   if os(windows)
     cpp-options: -DIS_WINDOWS
