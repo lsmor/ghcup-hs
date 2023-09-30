@@ -326,9 +326,7 @@ executable ghcup
       , transformers  ^>=0.5
       , unix          ^>=2.7
       , vty           ^>=5.37
-      , microlens     ^>=0.4.13
-      , microlens-th  ^>=0.4.3
-      , microlens-mtl ^>=0.2.0
+      , optics        ^>=0.4
 
   if os(windows)
     cpp-options: -DIS_WINDOWS
@@ -354,7 +352,7 @@ test-suite ghcup-test
   default-language:   Haskell2010
   default-extensions:
     LambdaCase
-    MultiWayIf
+    MultiWayIf++-
     PackageImports
     RecordWildCards
     ScopedTypeVariables

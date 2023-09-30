@@ -5,6 +5,8 @@
 {-# LANGUAGE TypeApplications  #-}
 {-# LANGUAGE RankNTypes        #-}
 {-# LANGUAGE ViewPatterns      #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE TemplateHaskell   #-}
 
 module BrickMain where
@@ -22,15 +24,57 @@ import           GHCup.Prelude.Logger
 import           GHCup.Prelude.Process
 import           GHCup.Prompts
 
-import           Brick
-import           Brick.Widgets.Border
-import           Brick.Widgets.Border.Style
-import           Brick.Widgets.Center
+import Brick
+    ( defaultMain,
+      suspendAndResume,
+      attrMap,
+      showFirstCursor,
+      hLimit,
+      vBox,
+      viewport,
+      visible,
+      fill,
+      vLimit,
+      forceAttr,
+      putCursor,
+      updateAttrMap,
+      withDefAttr,
+      padLeft,
+      (<+>),
+      emptyWidget,
+      txtWrap,
+      attrName,
+      withAttr,
+      (<=>),
+      str,
+      withBorderStyle,
+      padBottom,
+      halt,
+      BrickEvent(VtyEvent, MouseDown),
+      App(..),
+      ViewportType(Vertical),
+      Size(Greedy),
+      Location(Location),
+      Padding(Max, Pad),
+      Widget(Widget, render),
+      AttrMap,
+      Direction(..),
+      get,
+      zoom, 
+      EventM,
+      suffixLenses,
+      Named(..), modify )
+import           Brick.Widgets.Border ( hBorder, borderWithLabel )
+import           Brick.Widgets.Border.Style ( unicode )
+import           Brick.Widgets.Center ( center )
 import           Brick.Widgets.Dialog (buttonSelectedAttr)
 import           Brick.Widgets.List             ( listSelectedFocusedAttr
                                                 , listSelectedAttr
                                                 , listAttr
                                                 )
+import qualified Brick.Widgets.List as L
+import           Brick.Focus (FocusRing)
+import qualified Brick.Focus as F
 import           Codec.Archive
 import           Control.Exception.Safe
 #if !MIN_VERSION_base(4,13,0)
@@ -41,6 +85,7 @@ import           Control.Monad.Trans.Except
 import           Control.Monad.Trans.Resource
 import           Data.Bool
 import           Data.Functor
+import           Data.Function ( (&))
 import           Data.List
 import           Data.Maybe
 import           Data.IORef (IORef, readIORef, newIORef, writeIORef, modifyIORef)
@@ -63,9 +108,154 @@ import qualified Graphics.Vty                  as Vty
 import qualified Data.Vector                   as V
 import System.Environment (getExecutablePath)
 import qualified System.Posix.Process          as SPP
-import Lens.Micro.TH (makeLenses)
-import Lens.Micro.Mtl ( (.=), use, (%=), view )
-import Lens.Micro ((.~), (&))
+
+import           Optics.TH (makeLenses, makeLensesFor)
+import           Optics.State (use)
+import           Optics.State.Operators ( (.=), (%=), (<%=))
+import           Optics.Optic ((%))
+import           Optics.Operators ((.~), (^.))
+import           Optics.Getter (view)
+import           Optics.Lens (Lens', lens, toLensVL, lensVL)
+
+{- Brick's widget:
+It is a FocusRing over many list's. Each list contains the information for each tool. Each list has an internal name (for Brick's runtime)
+and a label which we can use in rendering. This data-structure helps to reuse Brick.Widget.List and to navegate easily across
+
+Consider this code as private. GenericSectionList should not be used directly as the FocusRing should be align with the Vector containing 
+the elements, otherwise you'd be focusing on a non-existent widget with unknown result (In theory the code is safe unless you have an empty section list). 
+
+- To build a SectionList use the safe constructor sectionList
+- To access sections use the lens provider sectionL and the name of the section you'd like to access
+- You can modify Brick.Widget.List.GenericList within GenericSectionList via sectionL but do not
+  modify the vector length
+
+-}
+
+data GenericSectionList n t e
+    = GenericSectionList
+    { sectionListFocusRing :: FocusRing n                   -- ^ The FocusRing for all sections
+    , sectionListElements :: !(Vector (L.GenericList n t e)) -- ^ A key-value vector
+    , sectionListName :: n                                   -- ^ The section list name
+    }
+
+makeLensesFor [("sectionListFocusRing", "sectionListFocusRingL"), ("sectionListElements", "sectionListElementsL"), ("sectionListName", "sectionListNameL")] ''GenericSectionList
+
+type SectionList n e = GenericSectionList n V.Vector e
+
+instance Named (GenericSectionList n t e) n where
+    getName = sectionListName
+
+
+-- | Build a SectionList from nonempty list. If empty we could not defined sectionL lenses. 
+sectionList :: Foldable t 
+            => n                     -- The name of the section list
+            -> [(n, t e)]            -- a list of tuples (section name, collection of elements)
+            -> Int
+            -> GenericSectionList n t e
+sectionList name elements height
+  = GenericSectionList
+  { sectionListFocusRing = F.focusRing [section_name | (section_name, _) <- elements]
+  , sectionListElements  = V.fromList [L.list section_name els height | (section_name, els) <- elements]
+  , sectionListName = name
+  }
+-- | This lens constructor, takes a name and looks if a section has such a name.
+--   Used to dispatch events to sections. It is a partial function only meant to 
+--   be used with the FocusRing inside GenericSectionList
+sectionL :: Eq n => n -> Lens' (GenericSectionList n t e) (L.GenericList n t e)
+sectionL section_name = lens g s
+    where is_section_name = (== section_name) . L.listName
+          g section_list =
+            let elms   = section_list ^. sectionListElementsL
+                zeroth = elms V.! 0 -- TODO: This crashes for empty vectors. 
+            in fromMaybe zeroth (V.find is_section_name elms)
+          s gl@(GenericSectionList _ elms _) list =
+            case V.findIndex is_section_name elms of
+                 Nothing -> gl
+                 Just i  -> let new_elms = V.update elms (V.fromList [(i, list)])
+                             in gl & sectionListElementsL .~ new_elms
+
+-- | Handle events for list cursor movement.  Events handled are:
+--
+-- * Up (up arrow key). If first element of section, then jump prev section
+-- * Down (down arrow key). If last element of section, then jump next section
+-- * Page Up (PgUp)
+-- * Page Down (PgDown)
+-- * Go to next section (Tab)
+-- * Go to prev section (BackTab)
+handleGenericListEvent :: (Foldable t, L.Splittable t, Ord n)
+                       => BrickEvent n ()
+                       -> EventM n (GenericSectionList n t e) ()
+handleGenericListEvent (VtyEvent (Vty.EvKey (Vty.KChar '\t') [])) = sectionListFocusRingL %= F.focusNext
+handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KBackTab []))     = sectionListFocusRingL %= F.focusPrev
+handleGenericListEvent (VtyEvent ev@(Vty.EvKey Vty.KDown [])) = do
+    ring <- use sectionListFocusRingL
+    case F.focusGetCurrent ring of 
+        Nothing -> pure ()
+        Just l  -> do      -- If it is the last element, move to the first element of the next focus; else, just handle regular list event.
+            current_list <- use (sectionL l)
+            let current_idx = L.listSelected current_list
+                list_length = current_list & length
+            if current_idx == Just (list_length - 1)
+                then do 
+                    new_focus <- sectionListFocusRingL <%= F.focusNext
+                    case F.focusGetCurrent new_focus of
+                        Nothing -> pure () -- |- Optic.Zoom.zoom doesn't typecheck but Lens.Micro.Mtl.zoom does. It is re-exported by Brick
+                        Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToBeginning)
+                else zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
+handleGenericListEvent (VtyEvent ev@(Vty.EvKey Vty.KUp [])) = do
+    ring <- use sectionListFocusRingL
+    case F.focusGetCurrent ring of
+        Nothing -> pure ()
+        Just l  -> do  -- If it is the first element, move to the last element of the prev focus; else, just handle regular list event.
+            current_list <- use (sectionL l)
+            let current_idx = L.listSelected current_list
+            if current_idx == Just 0
+                then do 
+                    new_focus <- sectionListFocusRingL <%= F.focusPrev
+                    case F.focusGetCurrent new_focus of
+                        Nothing -> pure ()  
+                        Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToEnd)
+                else zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
+handleGenericListEvent (VtyEvent ev) = do
+    ring <- use sectionListFocusRingL
+    case F.focusGetCurrent ring of
+        Nothing -> pure ()
+        Just l  -> zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
+handleGenericListEvent _ = pure ()
+
+-- This re-uses Brick.Widget.List.renderList
+renderSectionList :: (Traversable t, Ord n, Show n, Eq n, L.Splittable t)
+                  => (Bool -> n -> Widget n)             -- ^ Rendering function for separator between sections. True for selected before section
+                  -> (Bool -> n -> Widget n -> Widget n) -- ^ Rendering function for the borders. True for selected section
+                  -> (Bool -> e -> Widget n)             -- ^ Rendering function of the list element, True for the selected element
+                  -> Bool                                -- ^ Whether the section list has focus
+                  -> GenericSectionList n t e            -- ^ The section list to render
+                  -> Widget n
+renderSectionList render_separator render_border render_elem section_focus (GenericSectionList focus elms _) =
+    V.foldl' (\wacc list ->
+                let has_focus = is_focused_section list
+                    list_name = L.listName list
+                 in   wacc
+                  <=> render_separator has_focus list_name
+                  <=> inner_widget has_focus list_name list
+             )
+             emptyWidget elms
+  where
+    is_focused_section l = section_focus && Just (L.listName l) == F.focusGetCurrent focus
+    inner_widget has_focus k l = render_border has_focus k (L.renderList render_elem has_focus l)
+
+
+-- | Equivalent to listSelectedElement
+sectionListSelectedElement :: (Eq n, L.Splittable t, Traversable t, Semigroup (t e)) => GenericSectionList n t e -> Maybe (Int, e)
+sectionListSelectedElement generic_section_list = do
+  current_focus <- generic_section_list ^. sectionListFocusRingL & F.focusGetCurrent 
+  let current_section = generic_section_list ^. sectionL current_focus
+  L.listSelectedElement current_section 
+
+{- GHCUp State
+
+-}
+
 
 hiddenTools :: [Tool]
 hiddenTools = [] 
