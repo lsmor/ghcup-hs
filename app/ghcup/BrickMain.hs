@@ -72,6 +72,7 @@ import           Brick.Widgets.List             ( listSelectedFocusedAttr
                                                 , listSelectedAttr
                                                 , listAttr
                                                 )
+import qualified Brick.Widgets.Core as Widgets
 import qualified Brick.Widgets.List as L
 import           Brick.Focus (FocusRing)
 import qualified Brick.Focus as F
@@ -85,8 +86,10 @@ import           Control.Monad.Trans.Except
 import           Control.Monad.Trans.Resource
 import           Data.Bool
 import           Data.Functor
-import           Data.Function ( (&))
+import           Data.Function ( (&), on)
 import           Data.List
+import           Data.List.NonEmpty (NonEmpty, toList)
+import qualified Data.List.NonEmpty as NonEmpty
 import           Data.Maybe
 import           Data.IORef (IORef, readIORef, newIORef, writeIORef, modifyIORef)
 import           Data.Vector                    ( Vector
@@ -106,14 +109,13 @@ import qualified Data.Text.Lazy.Builder        as B
 import qualified Data.Text.Lazy                as L
 import qualified Graphics.Vty                  as Vty
 import qualified Data.Vector                   as V
-import System.Environment (getExecutablePath)
+import           System.Environment (getExecutablePath)
 import qualified System.Posix.Process          as SPP
-
 import           Optics.TH (makeLenses, makeLensesFor)
 import           Optics.State (use)
 import           Optics.State.Operators ( (.=), (%=), (<%=))
 import           Optics.Optic ((%))
-import           Optics.Operators ((.~), (^.))
+import           Optics.Operators ((.~), (^.), (%~))
 import           Optics.Getter (view)
 import           Optics.Lens (Lens', lens, toLensVL, lensVL)
 
@@ -174,20 +176,8 @@ sectionL section_name = lens g s
                  Just i  -> let new_elms = V.update elms (V.fromList [(i, list)])
                              in gl & sectionListElementsL .~ new_elms
 
--- | Handle events for list cursor movement.  Events handled are:
---
--- * Up (up arrow key). If first element of section, then jump prev section
--- * Down (down arrow key). If last element of section, then jump next section
--- * Page Up (PgUp)
--- * Page Down (PgDown)
--- * Go to next section (Tab)
--- * Go to prev section (BackTab)
-handleGenericListEvent :: (Foldable t, L.Splittable t, Ord n)
-                       => BrickEvent n ()
-                       -> EventM n (GenericSectionList n t e) ()
-handleGenericListEvent (VtyEvent (Vty.EvKey (Vty.KChar '\t') [])) = sectionListFocusRingL %= F.focusNext
-handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KBackTab []))     = sectionListFocusRingL %= F.focusPrev
-handleGenericListEvent (VtyEvent ev@(Vty.EvKey Vty.KDown [])) = do
+moveDown :: (L.Splittable t, Ord n, Foldable t) => EventM n (GenericSectionList n t e) ()
+moveDown = do 
     ring <- use sectionListFocusRingL
     case F.focusGetCurrent ring of 
         Nothing -> pure ()
@@ -201,8 +191,10 @@ handleGenericListEvent (VtyEvent ev@(Vty.EvKey Vty.KDown [])) = do
                     case F.focusGetCurrent new_focus of
                         Nothing -> pure () -- |- Optic.Zoom.zoom doesn't typecheck but Lens.Micro.Mtl.zoom does. It is re-exported by Brick
                         Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToBeginning)
-                else zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
-handleGenericListEvent (VtyEvent ev@(Vty.EvKey Vty.KUp [])) = do
+                else zoom (toLensVL $ sectionL l) $ (modify L.listMoveDown)
+
+moveUp :: (L.Splittable t, Ord n, Foldable t) => EventM n (GenericSectionList n t e) ()
+moveUp = do
     ring <- use sectionListFocusRingL
     case F.focusGetCurrent ring of
         Nothing -> pure ()
@@ -215,7 +207,26 @@ handleGenericListEvent (VtyEvent ev@(Vty.EvKey Vty.KUp [])) = do
                     case F.focusGetCurrent new_focus of
                         Nothing -> pure ()  
                         Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToEnd)
-                else zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
+                else zoom (toLensVL $ sectionL l) $ (modify L.listMoveUp)
+
+-- | Handle events for list cursor movement.  Events handled are:
+--
+-- * Up (up arrow key). If first element of section, then jump prev section
+-- * Down (down arrow key). If last element of section, then jump next section
+-- * Page Up (PgUp)
+-- * Page Down (PgDown)
+-- * Go to next section (Tab)
+-- * Go to prev section (BackTab)
+handleGenericListEvent :: (Foldable t, L.Splittable t, Ord n)
+                       => BrickEvent n a
+                       -> EventM n (GenericSectionList n t e) ()
+handleGenericListEvent (VtyEvent (Vty.EvResize _ _))              = pure ()
+handleGenericListEvent (VtyEvent (Vty.EvKey (Vty.KChar '\t') [])) = sectionListFocusRingL %= F.focusNext
+handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KBackTab []))     = sectionListFocusRingL %= F.focusPrev
+handleGenericListEvent (MouseDown _ Vty.BScrollDown _ _)          = moveDown
+handleGenericListEvent (MouseDown _ Vty.BScrollUp _ _)            = moveUp
+handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KDown []))     = moveDown
+handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KUp []))       = moveUp
 handleGenericListEvent (VtyEvent ev) = do
     ring <- use sectionListFocusRingL
     case F.focusGetCurrent ring of
@@ -242,7 +253,10 @@ renderSectionList render_separator render_border render_elem section_focus (Gene
              emptyWidget elms
   where
     is_focused_section l = section_focus && Just (L.listName l) == F.focusGetCurrent focus
-    inner_widget has_focus k l = render_border has_focus k (L.renderList render_elem has_focus l)
+    inner_widget has_focus k l = 
+      if has_focus
+        then Widgets.str (show k <> " Has focus")
+        else Widgets.str (show k <> " Hasn't focus") --render_border has_focus k (L.renderList render_elem has_focus l)
 
 
 -- | Equivalent to listSelectedElement
@@ -256,6 +270,7 @@ sectionListSelectedElement generic_section_list = do
 
 -}
 
+type Name = String
 
 hiddenTools :: [Tool]
 hiddenTools = [] 
@@ -275,13 +290,7 @@ data BrickSettings = BrickSettings
 
 makeLenses ''BrickSettings
 
-data BrickInternalState = BrickInternalState
-  { _clr   :: Vector ListResult
-  , _ix    :: Int
-  }
-  --deriving Show
-
-makeLenses ''BrickInternalState
+type BrickInternalState = SectionList Name ListResult
 
 data BrickState = BrickState
   { _appData     :: BrickData
@@ -315,8 +324,6 @@ keyHandlers KeyBindings {..} =
        if _showAllTools then "Don't show all tools" else "Show all tools"
     , hideShowHandler' _showAllVersions (not . _showAllTools)
     )
-  , (bUp, const "Up", appState %= moveCursor 1 Up)
-  , (bDown, const "Down", appState %= moveCursor 1 Down)
   ]
  where
   --hideShowHandler' :: (BrickSettings -> Bool) -> (BrickSettings -> Bool) -> m ()
@@ -347,7 +354,6 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
           (center (header <=> hBorder <=> renderList' _appState))
       )
     <=> footer
-
  where
   footer =
     withAttr (attrName "help")
@@ -362,11 +368,14 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
       <+> minHSize 15 (str "Version")
       <+> padLeft (Pad 1) (minHSize 25 $ str "Tags")
       <+> padLeft (Pad 5) (str "Notes")
-  renderList' bis@BrickInternalState{..} =
-    let minTagSize = V.maximum $ V.map (length . intercalate "," . fmap tagToString . lTag) _clr
-        minVerSize = V.maximum $ V.map (\ListResult{..} -> T.length $ tVerToText (GHCTargetVersion lCross lVer)) _clr
-    in withDefAttr listAttr . drawListElements (renderItem minTagSize minVerSize) True $ bis
-  renderItem minTagSize minVerSize _ b listResult@ListResult{lTag = lTag', ..} =
+  renderList' bis = 
+    let allElements = V.concatMap L.listElements $ sectionListElements bis
+        minTagSize = V.maximum $ V.map (length . intercalate "," . fmap tagToString . lTag) allElements
+        minVerSize = V.maximum $ V.map (\ListResult{..} -> T.length $ tVerToText (GHCTargetVersion lCross lVer)) allElements
+        render_separator _ _ = hBorder
+        render_border _ _ _ = Brick.emptyWidget
+    in withDefAttr listAttr $ renderSectionList render_separator render_border (renderItem minTagSize minVerSize) True bis
+  renderItem minTagSize minVerSize b listResult@ListResult{lTag = lTag', ..} =
     let marks = if
           | lSet       -> (withAttr (attrName "set") $ str "✔✔")
           | lInstalled -> (withAttr (attrName "installed") $ str "✓ ")
@@ -437,7 +446,7 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
   -- for drawing and 'listItemHeight'. At most, it will evaluate up to
   -- element @(i + h + 1)@ where @i@ is the selected index and @h@ is the
   -- available height.
-  drawListElements :: (Int -> Bool -> ListResult -> Widget String)
+  {- drawListElements :: (Int -> Bool -> ListResult -> Widget String)
                    -> Bool
                    -> BrickInternalState
                    -> Widget String
@@ -465,6 +474,7 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
         $ viewport "GHCup" Vertical
         $ vBox
         $ V.toList drawnElements
+        -}
 
 
 minHSize :: Int -> Widget n -> Widget n
@@ -498,7 +508,6 @@ defaultAttributes no_color = attrMap
   , (attrName "day"               , Vty.defAttr `withForeColor` Vty.blue)
   , (attrName "help"              , Vty.defAttr `withStyle`     Vty.italic)
   , (attrName "hooray"            , Vty.defAttr `withForeColor` Vty.brightWhite)
-  , (buttonSelectedAttr           , Vty.defAttr `withBackColor` Vty.brightWhite)
   ]
   where
     withForeColor | no_color  = const
@@ -523,34 +532,30 @@ eventHandler :: BrickEvent String e -> EventM String BrickState ()
 eventHandler ev = do
   AppState { keyBindings = kb } <- liftIO $ readIORef settings'
   case ev of
-    (MouseDown _ Vty.BScrollUp _ _) -> appState %= moveCursor 1 Up
-    (MouseDown _ Vty.BScrollDown _ _) -> appState %= moveCursor 1 Down
-    (VtyEvent (Vty.EvResize _ _)) -> pure ()
-    (VtyEvent (Vty.EvKey Vty.KUp _)) -> appState %= moveCursor 1 Up
-    (VtyEvent (Vty.EvKey Vty.KDown _)) -> appState %= moveCursor 1 Down
-    (VtyEvent (Vty.EvKey key _)) ->
+    ev@(VtyEvent (Vty.EvKey key _)) ->
       case find (\(key', _, _) -> key' == key) (keyHandlers kb) of
-        Nothing -> pure ()
+        Nothing -> void $ zoom (toLensVL $ appState) $ handleGenericListEvent ev
         Just (_, _, handler) -> handler
-    _ -> pure ()
+    ev -> zoom (toLensVL $ appState) $ handleGenericListEvent ev
 
-
+moveCursor = undefined
+{-
 moveCursor :: Int -> Direction -> BrickInternalState -> BrickInternalState
 moveCursor steps direction ais@BrickInternalState{..} =
   let newIx = if direction == Down then _ix + steps else _ix - steps
   in  case _clr !? newIx of
         Just _  -> ais & ix .~ newIx
         Nothing -> ais
-
+-}
 
 -- | Suspend the current UI and run an IO action in terminal. If the
 -- IO action returns a Left value, then it's thrown as userError.
-withIOAction :: Ord n
+withIOAction :: (Ord n, Eq n)
              => ( (Int, ListResult) -> ReaderT AppState IO (Either String a))
              -> EventM n BrickState ()
 withIOAction action = do
   as <- get
-  case listSelectedElement' (view appState as) of
+  case sectionListSelectedElement (view appState as) of
     Nothing      -> pure ()
     Just (curr_ix, e) -> do
       suspendAndResume $ do
@@ -588,12 +593,19 @@ constructList appD appSettings =
                            (_showAllTools appSettings))
             (_lr appD)
 
-listSelectedElement' :: BrickInternalState -> Maybe (Int, ListResult)
-listSelectedElement' BrickInternalState{..} = fmap (_ix, ) $ _clr !? _ix
+-- | Focus on the tool section and the predicate which matches. If no result matches, focus on index 0
+selectBy :: Tool -> (ListResult -> Bool) -> BrickInternalState -> BrickInternalState
+selectBy tool predicate internal_state =
+  let new_focus = F.focusSetCurrent (show tool) (view sectionListFocusRingL internal_state)
+      tool_lens = sectionL (show tool) 
+   in internal_state
+        & sectionListFocusRingL .~ new_focus
+        & tool_lens %~ L.listMoveTo 0            -- We move to 0 first
+        & tool_lens %~ L.listFindBy predicate    -- The lookup by the predicate.
 
-
-selectLatest :: Vector ListResult -> Int
-selectLatest = fromMaybe 0 . V.findIndex (\ListResult {..} -> lTool == GHC && Latest `elem` lTag)
+-- | Select the latests GHC tool
+selectLatest :: BrickInternalState -> BrickInternalState
+selectLatest = selectBy GHC (elem Latest . lTag)
 
 
 -- | Replace the @appState@ or construct it based on a filter function
@@ -603,14 +615,13 @@ replaceLR :: (ListResult -> Bool)
           -> [ListResult]
           -> Maybe BrickInternalState
           -> BrickInternalState
-replaceLR filterF lr s =
-  let oldElem = s >>= listSelectedElement'
-      newVec  = V.fromList . filter filterF $ lr
-      newSelected =
-        case oldElem >>= \(_, oldE) -> V.findIndex (toolEqual oldE) newVec of
-          Just ix -> ix
-          Nothing -> selectLatest newVec
-  in  BrickInternalState newVec newSelected
+replaceLR filterF list_result s =
+  let oldElem = s >>= sectionListSelectedElement -- Maybe (Int, e)
+      newVec  =  [(show $ lTool (head g), V.fromList g) | g <- groupBy ((==) `on` lTool ) (filter filterF list_result)]
+      newSectionList = sectionList "GHCup" newVec 0
+  in case oldElem of
+      Just (_, el) -> selectBy (lTool el) (toolEqual el) newSectionList
+      Nothing -> selectLatest newSectionList
  where
   toolEqual e1 e2 =
     lTool e1 == lTool e2 && lVer e1 == lVer e2 && lCross e1 == lCross e2
@@ -866,4 +877,3 @@ getAppData mgi = runExceptT $ do
   flip runReaderT settings $ do
     lV <- listVersions Nothing [] False True (Nothing, Nothing)
     pure $ BrickData (reverse lV)
-
