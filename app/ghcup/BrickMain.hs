@@ -30,13 +30,8 @@ import Brick
       attrMap,
       showFirstCursor,
       hLimit,
-      vBox,
-      viewport,
-      visible,
       fill,
       vLimit,
-      forceAttr,
-      putCursor,
       updateAttrMap,
       withDefAttr,
       padLeft,
@@ -52,27 +47,15 @@ import Brick
       halt,
       BrickEvent(VtyEvent, MouseDown),
       App(..),
-      ViewportType(Vertical),
-      Size(Greedy),
-      Location(Location),
       Padding(Max, Pad),
-      Widget(Widget, render),
       AttrMap,
-      Direction(..),
       get,
-      zoom, 
+      zoom,
       EventM,
-      suffixLenses,
-      Named(..), modify )
-import           Brick.Widgets.Border ( hBorder, borderWithLabel )
+      Named(..), modify, Widget )
+import           Brick.Widgets.Border ( hBorder, borderWithLabel)
 import           Brick.Widgets.Border.Style ( unicode )
 import           Brick.Widgets.Center ( center )
-import           Brick.Widgets.Dialog (buttonSelectedAttr)
-import           Brick.Widgets.List             ( listSelectedFocusedAttr
-                                                , listSelectedAttr
-                                                , listAttr
-                                                )
-import qualified Brick.Widgets.Core as Widgets
 import qualified Brick.Widgets.List as L
 import           Brick.Focus (FocusRing)
 import qualified Brick.Focus as F
@@ -88,12 +71,10 @@ import           Data.Bool
 import           Data.Functor
 import           Data.Function ( (&), on)
 import           Data.List
-import           Data.List.NonEmpty (NonEmpty, toList)
-import qualified Data.List.NonEmpty as NonEmpty
 import           Data.Maybe
 import           Data.IORef (IORef, readIORef, newIORef, writeIORef, modifyIORef)
 import           Data.Vector                    ( Vector
-                                                , (!?)
+                                                
                                                 )
 import           Data.Versions           hiding ( str, Lens' )
 import           Haskus.Utils.Variant.Excepts
@@ -114,10 +95,9 @@ import qualified System.Posix.Process          as SPP
 import           Optics.TH (makeLenses, makeLensesFor)
 import           Optics.State (use)
 import           Optics.State.Operators ( (.=), (%=), (<%=))
-import           Optics.Optic ((%))
 import           Optics.Operators ((.~), (^.), (%~))
 import           Optics.Getter (view)
-import           Optics.Lens (Lens', lens, toLensVL, lensVL)
+import           Optics.Lens (Lens', lens, toLensVL)
 
 {- Brick's widget:
 It is a FocusRing over many list's. Each list contains the information for each tool. Each list has an internal name (for Brick's runtime)
@@ -191,7 +171,7 @@ moveDown = do
                     case F.focusGetCurrent new_focus of
                         Nothing -> pure () -- |- Optic.Zoom.zoom doesn't typecheck but Lens.Micro.Mtl.zoom does. It is re-exported by Brick
                         Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToBeginning)
-                else zoom (toLensVL $ sectionL l) $ (modify L.listMoveDown)
+                else zoom (toLensVL $ sectionL l) $ modify L.listMoveDown
 
 moveUp :: (L.Splittable t, Ord n, Foldable t) => EventM n (GenericSectionList n t e) ()
 moveUp = do
@@ -207,7 +187,7 @@ moveUp = do
                     case F.focusGetCurrent new_focus of
                         Nothing -> pure ()  
                         Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToEnd)
-                else zoom (toLensVL $ sectionL l) $ (modify L.listMoveUp)
+                else zoom (toLensVL $ sectionL l) $ modify L.listMoveUp
 
 -- | Handle events for list cursor movement.  Events handled are:
 --
@@ -244,19 +224,16 @@ renderSectionList :: (Traversable t, Ord n, Show n, Eq n, L.Splittable t)
                   -> Widget n
 renderSectionList render_separator render_border render_elem section_focus (GenericSectionList focus elms _) =
     V.foldl' (\wacc list ->
-                let has_focus = is_focused_section list
+                let has_focus_list = is_focused_section list
                     list_name = L.listName list
                  in   wacc
-                  <=> render_separator has_focus list_name
-                  <=> inner_widget has_focus list_name list
+                  <=> render_separator has_focus_list list_name
+                  <=> inner_widget has_focus_list list_name list
              )
              emptyWidget elms
   where
     is_focused_section l = section_focus && Just (L.listName l) == F.focusGetCurrent focus
-    inner_widget has_focus k l = 
-      if has_focus
-        then Widgets.str (show k <> " Has focus")
-        else Widgets.str (show k <> " Hasn't focus") --render_border has_focus k (L.renderList render_elem has_focus l)
+    inner_widget has_focus k l = render_border has_focus k (vLimit (length l) $ L.renderList render_elem has_focus l)
 
 
 -- | Equivalent to listSelectedElement
@@ -336,7 +313,7 @@ keyHandlers KeyBindings {..} =
     ad <- use appData
     current_app_state <- use appState
     appSettings .= newAppSettings
-    appState    .= constructList ad app_settings (Just current_app_state)
+    appState    .= constructList ad newAppSettings (Just current_app_state)
 
 
 
@@ -351,7 +328,7 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
   = padBottom Max
       ( withBorderStyle unicode
         $ borderWithLabel (str "GHCup")
-          (center (header <=> hBorder <=> renderList' _appState))
+          (center (header <=> renderList' _appState))
       )
     <=> footer
  where
@@ -373,8 +350,8 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
         minTagSize = V.maximum $ V.map (length . intercalate "," . fmap tagToString . lTag) allElements
         minVerSize = V.maximum $ V.map (\ListResult{..} -> T.length $ tVerToText (GHCTargetVersion lCross lVer)) allElements
         render_separator _ _ = hBorder
-        render_border _ _ _ = Brick.emptyWidget
-    in withDefAttr listAttr $ renderSectionList render_separator render_border (renderItem minTagSize minVerSize) True bis
+        render_border _ _ = id
+    in withDefAttr L.listAttr $ renderSectionList render_separator render_border (renderItem minTagSize minVerSize) True bis
   renderItem minTagSize minVerSize b listResult@ListResult{lTag = lTag', ..} =
     let marks = if
           | lSet       -> (withAttr (attrName "set") $ str "✔✔")
@@ -393,8 +370,7 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
           | elem Latest lTag' && not lInstalled =
               withAttr (attrName "hooray")
           | otherwise = id
-        active = if b then putCursor "GHCup" (Location (0,0)) . forceAttr (attrName "active") else id
-    in  hooray $ active $ dim
+    in  hooray $ dim
           (   marks
           <+> padLeft (Pad 2)
                ( minHSize 6
@@ -492,7 +468,8 @@ app attrs dimAttrs =
 defaultAttributes :: Bool -> AttrMap
 defaultAttributes no_color = attrMap
   Vty.defAttr
-  [ (attrName "active"            , Vty.defAttr `withBackColor` Vty.blue)
+  [ (L.listSelectedFocusedAttr    , Vty.defAttr `withBackColor` Vty.blue)  --, (attrName "active"            , Vty.defAttr `withBackColor` Vty.blue)
+  , (L.listSelectedAttr           , Vty.defAttr)                           -- we use list attributes for active.
   , (attrName "not-installed"     , Vty.defAttr `withForeColor` Vty.red)
   , (attrName "set"               , Vty.defAttr `withForeColor` Vty.green)
   , (attrName "installed"         , Vty.defAttr `withForeColor` Vty.green)
@@ -532,21 +509,11 @@ eventHandler :: BrickEvent String e -> EventM String BrickState ()
 eventHandler ev = do
   AppState { keyBindings = kb } <- liftIO $ readIORef settings'
   case ev of
-    ev@(VtyEvent (Vty.EvKey key _)) ->
+    inner_event@(VtyEvent (Vty.EvKey key _)) ->
       case find (\(key', _, _) -> key' == key) (keyHandlers kb) of
-        Nothing -> void $ zoom (toLensVL $ appState) $ handleGenericListEvent ev
+        Nothing -> void $ zoom (toLensVL appState) $ handleGenericListEvent inner_event
         Just (_, _, handler) -> handler
-    ev -> zoom (toLensVL $ appState) $ handleGenericListEvent ev
-
-moveCursor = undefined
-{-
-moveCursor :: Int -> Direction -> BrickInternalState -> BrickInternalState
-moveCursor steps direction ais@BrickInternalState{..} =
-  let newIx = if direction == Down then _ix + steps else _ix - steps
-  in  case _clr !? newIx of
-        Just _  -> ais & ix .~ newIx
-        Nothing -> ais
--}
+    inner_event -> zoom (toLensVL appState) $ handleGenericListEvent inner_event
 
 -- | Suspend the current UI and run an IO action in terminal. If the
 -- IO action returns a Left value, then it's thrown as userError.
@@ -583,14 +550,13 @@ updateList appD BrickState{..} =
                  , _appKeys     = _appKeys
                  }
 
-
 constructList :: BrickData
               -> BrickSettings
               -> Maybe BrickInternalState
               -> BrickInternalState
-constructList appD appSettings =
-  replaceLR (filterVisible (_showAllVersions appSettings)
-                           (_showAllTools appSettings))
+constructList appD settings =
+  replaceLR (filterVisible (_showAllVersions settings)
+                           (_showAllTools settings))
             (_lr appD)
 
 -- | Focus on the tool section and the predicate which matches. If no result matches, focus on index 0
