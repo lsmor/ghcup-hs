@@ -25,34 +25,18 @@ import           GHCup.Prelude.Process
 import           GHCup.Prompts
 
 import Brick
-    ( defaultMain,
-      suspendAndResume,
-      attrMap,
-      showFirstCursor,
-      hLimit,
-      fill,
-      vLimit,
-      updateAttrMap,
-      withDefAttr,
-      padLeft,
-      (<+>),
-      emptyWidget,
-      txtWrap,
-      attrName,
-      withAttr,
-      (<=>),
-      str,
-      withBorderStyle,
-      padBottom,
-      halt,
-      BrickEvent(VtyEvent, MouseDown),
+    ( BrickEvent(VtyEvent, MouseDown),
       App(..),
       Padding(Max, Pad),
       AttrMap,
-      get,
-      zoom,
       EventM,
-      Named(..), modify, Widget )
+      Size(..),
+      Named(..),
+      Widget(..), 
+      ViewportType (Vertical), 
+      (<+>),
+      (<=>))
+import qualified Brick
 import           Brick.Widgets.Border ( hBorder, borderWithLabel)
 import           Brick.Widgets.Border.Style ( unicode )
 import           Brick.Widgets.Center ( center )
@@ -170,8 +154,8 @@ moveDown = do
                     new_focus <- sectionListFocusRingL <%= F.focusNext
                     case F.focusGetCurrent new_focus of
                         Nothing -> pure () -- |- Optic.Zoom.zoom doesn't typecheck but Lens.Micro.Mtl.zoom does. It is re-exported by Brick
-                        Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToBeginning)
-                else zoom (toLensVL $ sectionL l) $ modify L.listMoveDown
+                        Just new_l -> Brick.zoom (toLensVL $ sectionL new_l) (Brick.modify L.listMoveToBeginning)
+                else Brick.zoom (toLensVL $ sectionL l) $ Brick.modify L.listMoveDown
 
 moveUp :: (L.Splittable t, Ord n, Foldable t) => EventM n (GenericSectionList n t e) ()
 moveUp = do
@@ -186,8 +170,8 @@ moveUp = do
                     new_focus <- sectionListFocusRingL <%= F.focusPrev
                     case F.focusGetCurrent new_focus of
                         Nothing -> pure ()  
-                        Just new_l -> zoom (toLensVL $ sectionL new_l) (modify L.listMoveToEnd)
-                else zoom (toLensVL $ sectionL l) $ modify L.listMoveUp
+                        Just new_l -> Brick.zoom (toLensVL $ sectionL new_l) (Brick.modify L.listMoveToEnd)
+                else Brick.zoom (toLensVL $ sectionL l) $ Brick.modify L.listMoveUp
 
 -- | Handle events for list cursor movement.  Events handled are:
 --
@@ -211,7 +195,7 @@ handleGenericListEvent (VtyEvent ev) = do
     ring <- use sectionListFocusRingL
     case F.focusGetCurrent ring of
         Nothing -> pure ()
-        Just l  -> zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
+        Just l  -> Brick.zoom (toLensVL $ sectionL l) $ L.handleListEvent ev
 handleGenericListEvent _ = pure ()
 
 -- This re-uses Brick.Widget.List.renderList
@@ -222,18 +206,22 @@ renderSectionList :: (Traversable t, Ord n, Show n, Eq n, L.Splittable t)
                   -> Bool                                -- ^ Whether the section list has focus
                   -> GenericSectionList n t e            -- ^ The section list to render
                   -> Widget n
-renderSectionList render_separator render_border render_elem section_focus (GenericSectionList focus elms _) =
-    V.foldl' (\wacc list ->
-                let has_focus_list = is_focused_section list
-                    list_name = L.listName list
-                 in   wacc
-                  <=> render_separator has_focus_list list_name
-                  <=> inner_widget has_focus_list list_name list
-             )
-             emptyWidget elms
+renderSectionList render_separator render_border render_elem section_focus (GenericSectionList focus elms sl_name) =
+  Widget Greedy Greedy $ render $
+    Brick.viewport sl_name Vertical $
+      V.foldl' (\wacc list ->
+                  let has_focus_list = is_focused_section list
+                      list_name = L.listName list
+                  in   wacc
+                    <=> render_separator has_focus_list list_name
+                    <=> inner_widget has_focus_list list_name list
+              )
+              Brick.emptyWidget elms
   where
     is_focused_section l = section_focus && Just (L.listName l) == F.focusGetCurrent focus
-    inner_widget has_focus k l = render_border has_focus k (vLimit (length l) $ L.renderList render_elem has_focus l)
+    inner_widget has_focus k l = 
+      let w = render_border has_focus k (Brick.vLimit (length l) $ L.renderList render_elem has_focus l)
+       in if has_focus then Brick.visible w else w
 
 
 -- | Equivalent to listSelectedElement
@@ -286,7 +274,7 @@ keyHandlers :: KeyBindings
                  )
                ]
 keyHandlers KeyBindings {..} =
-  [ (bQuit, const "Quit"     , halt)
+  [ (bQuit, const "Quit"     , Brick.halt)
   , (bInstall, const "Install"  , withIOAction install')
   , (bUninstall, const "Uninstall", withIOAction del')
   , (bSet, const "Set"      , withIOAction set')
@@ -325,38 +313,38 @@ showKey key = tail (show key)
 
 ui :: AttrMap -> BrickState -> Widget String
 ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
-  = padBottom Max
-      ( withBorderStyle unicode
-        $ borderWithLabel (str "GHCup")
+  = Brick.padBottom Max
+      ( Brick.withBorderStyle unicode
+        $ borderWithLabel (Brick.str "GHCup")
           (center (header <=> renderList' _appState))
       )
     <=> footer
  where
   footer =
-    withAttr (attrName "help")
-      . txtWrap
+    Brick.withAttr (Brick.attrName "help")
+      . Brick.txtWrap
       . T.pack
       . foldr1 (\x y -> x <> "  " <> y)
       . fmap (\(key, s, _) -> showKey key <> ":" <> s as)
       $ keyHandlers _appKeys
   header =
-    minHSize 2 emptyWidget
-      <+> padLeft (Pad 2) (minHSize 6 $ str "Tool")
-      <+> minHSize 15 (str "Version")
-      <+> padLeft (Pad 1) (minHSize 25 $ str "Tags")
-      <+> padLeft (Pad 5) (str "Notes")
+    minHSize 2 Brick.emptyWidget
+      <+> Brick.padLeft (Pad 2) (minHSize 6 $ Brick.str "Tool")
+      <+> minHSize 15 (Brick.str "Version")
+      <+> Brick.padLeft (Pad 1) (minHSize 25 $ Brick.str "Tags")
+      <+> Brick.padLeft (Pad 5) (Brick.str "Notes")
   renderList' bis = 
     let allElements = V.concatMap L.listElements $ sectionListElements bis
         minTagSize = V.maximum $ V.map (length . intercalate "," . fmap tagToString . lTag) allElements
         minVerSize = V.maximum $ V.map (\ListResult{..} -> T.length $ tVerToText (GHCTargetVersion lCross lVer)) allElements
         render_separator _ _ = hBorder
         render_border _ _ = id
-    in withDefAttr L.listAttr $ renderSectionList render_separator render_border (renderItem minTagSize minVerSize) True bis
+    in Brick.withDefAttr L.listAttr $ renderSectionList render_separator render_border (renderItem minTagSize minVerSize) True bis
   renderItem minTagSize minVerSize b listResult@ListResult{lTag = lTag', ..} =
     let marks = if
-          | lSet       -> (withAttr (attrName "set") $ str "✔✔")
-          | lInstalled -> (withAttr (attrName "installed") $ str "✓ ")
-          | otherwise  -> (withAttr (attrName "not-installed") $ str "✗ ")
+          | lSet       -> (Brick.withAttr (Brick.attrName "set") $ Brick.str "✔✔")
+          | lInstalled -> (Brick.withAttr (Brick.attrName "installed") $ Brick.str "✓ ")
+          | otherwise  -> (Brick.withAttr (Brick.attrName "not-installed") $ Brick.str "✗ ")
         ver = case lCross of
           Nothing -> T.unpack . prettyVer $ lVer
           Just c  -> T.unpack (c <> "-" <> prettyVer lVer)
@@ -364,97 +352,59 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
           | lNoBindist && not lInstalled
             && not b -- TODO: overloading dim and active ignores active
                        --       so we hack around it here
-          = updateAttrMap (const dimAttrs) . withAttr (attrName "no-bindist")
+          = Brick.updateAttrMap (const dimAttrs) . Brick.withAttr (Brick.attrName "no-bindist")
           | otherwise  = id
         hooray
           | elem Latest lTag' && not lInstalled =
-              withAttr (attrName "hooray")
+              Brick.withAttr (Brick.attrName "hooray")
           | otherwise = id
     in  hooray $ dim
           (   marks
-          <+> padLeft (Pad 2)
+          <+> Brick.padLeft (Pad 2)
                ( minHSize 6
                  (printTool lTool)
                )
-          <+> minHSize minVerSize (str ver)
+          <+> minHSize minVerSize (Brick.str ver)
           <+> (let l = catMaybes . fmap printTag $ sort lTag'
-               in  padLeft (Pad 1) $ minHSize minTagSize $ if null l
-                     then emptyWidget
-                     else foldr1 (\x y -> x <+> str "," <+> y) l
+               in  Brick.padLeft (Pad 1) $ minHSize minTagSize $ if null l
+                     then Brick.emptyWidget
+                     else foldr1 (\x y -> x <+> Brick.str "," <+> y) l
               )
-          <+> padLeft (Pad 5)
+          <+> Brick.padLeft (Pad 5)
               ( let notes = printNotes listResult
                 in  if null notes
-                      then emptyWidget
-                      else foldr1 (\x y -> x <+> str "," <+> y) notes
+                      then Brick.emptyWidget
+                      else foldr1 (\x y -> x <+> Brick.str "," <+> y) notes
               )
-          <+> vLimit 1 (fill ' ')
+          <+> Brick.vLimit 1 (Brick.fill ' ')
           )
 
-  printTag Recommended    = Just $ withAttr (attrName "recommended") $ str "recommended"
-  printTag Latest         = Just $ withAttr (attrName "latest") $ str "latest"
-  printTag Prerelease     = Just $ withAttr (attrName "prerelease") $ str "prerelease"
-  printTag Nightly        = Just $ withAttr (attrName "nightly") $ str "nightly"
-  printTag (Base pvp'')   = Just $ str ("base-" ++ T.unpack (prettyPVP pvp''))
+  printTag Recommended    = Just $ Brick.withAttr (Brick.attrName "recommended") $ Brick.str "recommended"
+  printTag Latest         = Just $ Brick.withAttr (Brick.attrName "latest") $ Brick.str "latest"
+  printTag Prerelease     = Just $ Brick.withAttr (Brick.attrName "prerelease") $ Brick.str "prerelease"
+  printTag Nightly        = Just $ Brick.withAttr (Brick.attrName "nightly") $ Brick.str "nightly"
+  printTag (Base pvp'')   = Just $ Brick.str ("base-" ++ T.unpack (prettyPVP pvp''))
   printTag Old            = Nothing
-  printTag LatestPrerelease = Just $ withAttr (attrName "latest-prerelease") $ str "latest-prerelease"
-  printTag LatestNightly    = Just $ withAttr (attrName "latest-nightly") $ str "latest-nightly"
-  printTag (UnknownTag t) = Just $ str t
+  printTag LatestPrerelease = Just $ Brick.withAttr (Brick.attrName "latest-prerelease") $ Brick.str "latest-prerelease"
+  printTag LatestNightly    = Just $ Brick.withAttr (Brick.attrName "latest-nightly") $ Brick.str "latest-nightly"
+  printTag (UnknownTag t) = Just $ Brick.str t
 
-  printTool Cabal = str "cabal"
-  printTool GHC = str "GHC"
-  printTool GHCup = str "GHCup"
-  printTool HLS = str "HLS"
-  printTool Stack = str "Stack"
+  printTool Cabal = Brick.str "cabal"
+  printTool GHC = Brick.str "GHC"
+  printTool GHCup = Brick.str "GHCup"
+  printTool HLS = Brick.str "HLS"
+  printTool Stack = Brick.str "Stack"
 
   printNotes ListResult {..} =
-    (if hlsPowered then [withAttr (attrName "hls-powered") $ str "hls-powered"] else mempty
+    (if hlsPowered then [Brick.withAttr (Brick.attrName "hls-powered") $ Brick.str "hls-powered"] else mempty
       )
-      ++ (if lStray then [withAttr (attrName "stray") $ str "stray"] else mempty)
+      ++ (if lStray then [Brick.withAttr (Brick.attrName "stray") $ Brick.str "stray"] else mempty)
       ++ (case lReleaseDay of
             Nothing -> mempty
-            Just d  -> [withAttr (attrName "day") $ str (show d)])
-
-  -- | Draws the list elements.
-  --
-  -- Evaluates the underlying container up to, and a bit beyond, the
-  -- selected element. The exact amount depends on available height
-  -- for drawing and 'listItemHeight'. At most, it will evaluate up to
-  -- element @(i + h + 1)@ where @i@ is the selected index and @h@ is the
-  -- available height.
-  {- drawListElements :: (Int -> Bool -> ListResult -> Widget String)
-                   -> Bool
-                   -> BrickInternalState
-                   -> Widget String
-  drawListElements drawElem foc is@(BrickInternalState clr _) =
-    Widget Greedy Greedy $
-      let
-        es = clr
-        listSelected        = fmap fst $ listSelectedElement' is
-
-        drawnElements = flip V.imap es $ \i' e ->
-          let addSeparator w = case es !? (i' - 1) of
-                Just e' | lTool e' /= lTool e ->
-                  hBorder <=> w
-                _                             -> w
-
-              isSelected  = Just i' == listSelected
-              elemWidget  = drawElem i' isSelected e
-              selItemAttr = if foc
-                then withDefAttr listSelectedFocusedAttr
-                else withDefAttr listSelectedAttr
-              makeVisible' = if isSelected then visible . selItemAttr else id
-          in  addSeparator $ makeVisible' elemWidget
-
-      in render
-        $ viewport "GHCup" Vertical
-        $ vBox
-        $ V.toList drawnElements
-        -}
-
+            Just d  -> [Brick.withAttr (Brick.attrName "day") $ Brick.str (show d)])
 
 minHSize :: Int -> Widget n -> Widget n
-minHSize s' = hLimit s' . vLimit 1 . (<+> fill ' ')
+minHSize s' = Brick.hLimit s' . Brick.vLimit 1 . (<+> Brick.fill ' ')
 
 app :: AttrMap -> AttrMap -> App BrickState () String
 app attrs dimAttrs =
@@ -462,29 +412,29 @@ app attrs dimAttrs =
   , appHandleEvent  = eventHandler
   , appStartEvent   = return ()
   , appAttrMap      = const attrs
-  , appChooseCursor = showFirstCursor
+  , appChooseCursor = Brick.showFirstCursor
   }
 
 defaultAttributes :: Bool -> AttrMap
-defaultAttributes no_color = attrMap
+defaultAttributes no_color = Brick.attrMap
   Vty.defAttr
-  [ (L.listSelectedFocusedAttr    , Vty.defAttr `withBackColor` Vty.blue)  --, (attrName "active"            , Vty.defAttr `withBackColor` Vty.blue)
-  , (L.listSelectedAttr           , Vty.defAttr)                           -- we use list attributes for active.
-  , (attrName "not-installed"     , Vty.defAttr `withForeColor` Vty.red)
-  , (attrName "set"               , Vty.defAttr `withForeColor` Vty.green)
-  , (attrName "installed"         , Vty.defAttr `withForeColor` Vty.green)
-  , (attrName "recommended"       , Vty.defAttr `withForeColor` Vty.green)
-  , (attrName "hls-powered"       , Vty.defAttr `withForeColor` Vty.green)
-  , (attrName "latest"            , Vty.defAttr `withForeColor` Vty.yellow)
-  , (attrName "latest-prerelease" , Vty.defAttr `withForeColor` Vty.red)
-  , (attrName "latest-nightly"    , Vty.defAttr `withForeColor` Vty.red)
-  , (attrName "prerelease"        , Vty.defAttr `withForeColor` Vty.red)
-  , (attrName "nightly"           , Vty.defAttr `withForeColor` Vty.red)
-  , (attrName "compiled"          , Vty.defAttr `withForeColor` Vty.blue)
-  , (attrName "stray"             , Vty.defAttr `withForeColor` Vty.blue)
-  , (attrName "day"               , Vty.defAttr `withForeColor` Vty.blue)
-  , (attrName "help"              , Vty.defAttr `withStyle`     Vty.italic)
-  , (attrName "hooray"            , Vty.defAttr `withForeColor` Vty.brightWhite)
+  [ (L.listSelectedFocusedAttr          , Vty.defAttr `withBackColor` Vty.blue)  --, (attrName "active"            , Vty.defAttr `withBackColor` Vty.blue)
+  , (L.listSelectedAttr                 , Vty.defAttr)                           -- we use list attributes for active.
+  , (Brick.attrName "not-installed"     , Vty.defAttr `withForeColor` Vty.red)
+  , (Brick.attrName "set"               , Vty.defAttr `withForeColor` Vty.green)
+  , (Brick.attrName "installed"         , Vty.defAttr `withForeColor` Vty.green)
+  , (Brick.attrName "recommended"       , Vty.defAttr `withForeColor` Vty.green)
+  , (Brick.attrName "hls-powered"       , Vty.defAttr `withForeColor` Vty.green)
+  , (Brick.attrName "latest"            , Vty.defAttr `withForeColor` Vty.yellow)
+  , (Brick.attrName "latest-prerelease" , Vty.defAttr `withForeColor` Vty.red)
+  , (Brick.attrName "latest-nightly"    , Vty.defAttr `withForeColor` Vty.red)
+  , (Brick.attrName "prerelease"        , Vty.defAttr `withForeColor` Vty.red)
+  , (Brick.attrName "nightly"           , Vty.defAttr `withForeColor` Vty.red)
+  , (Brick.attrName "compiled"          , Vty.defAttr `withForeColor` Vty.blue)
+  , (Brick.attrName "stray"             , Vty.defAttr `withForeColor` Vty.blue)
+  , (Brick.attrName "day"               , Vty.defAttr `withForeColor` Vty.blue)
+  , (Brick.attrName "help"              , Vty.defAttr `withStyle`     Vty.italic)
+  , (Brick.attrName "hooray"            , Vty.defAttr `withForeColor` Vty.brightWhite)
   ]
   where
     withForeColor | no_color  = const
@@ -496,10 +446,10 @@ defaultAttributes no_color = attrMap
     withStyle                 = Vty.withStyle
 
 dimAttributes :: Bool -> AttrMap
-dimAttributes no_color = attrMap
+dimAttributes no_color = Brick.attrMap
   (Vty.defAttr `Vty.withStyle` Vty.dim)
-  [ (attrName "active"    , Vty.defAttr `withBackColor` Vty.blue) -- has no effect ??
-  , (attrName "no-bindist", Vty.defAttr `Vty.withStyle` Vty.dim)
+  [ (Brick.attrName "active"    , Vty.defAttr `withBackColor` Vty.blue) -- has no effect ??
+  , (Brick.attrName "no-bindist", Vty.defAttr `Vty.withStyle` Vty.dim)
   ]
   where
     withBackColor | no_color  = \attr _ -> attr `Vty.withStyle` Vty.reverseVideo
@@ -511,9 +461,9 @@ eventHandler ev = do
   case ev of
     inner_event@(VtyEvent (Vty.EvKey key _)) ->
       case find (\(key', _, _) -> key' == key) (keyHandlers kb) of
-        Nothing -> void $ zoom (toLensVL appState) $ handleGenericListEvent inner_event
+        Nothing -> void $ Brick.zoom (toLensVL appState) $ handleGenericListEvent inner_event
         Just (_, _, handler) -> handler
-    inner_event -> zoom (toLensVL appState) $ handleGenericListEvent inner_event
+    inner_event -> Brick.zoom (toLensVL appState) $ handleGenericListEvent inner_event
 
 -- | Suspend the current UI and run an IO action in terminal. If the
 -- IO action returns a Left value, then it's thrown as userError.
@@ -521,11 +471,11 @@ withIOAction :: (Ord n, Eq n)
              => ( (Int, ListResult) -> ReaderT AppState IO (Either String a))
              -> EventM n BrickState ()
 withIOAction action = do
-  as <- get
+  as <- Brick.get
   case sectionListSelectedElement (view appState as) of
     Nothing      -> pure ()
     Just (curr_ix, e) -> do
-      suspendAndResume $ do
+      Brick.suspendAndResume $ do
         settings <- readIORef settings'
         flip runReaderT settings $ action (curr_ix, e) >>= \case
           Left  err -> liftIO $ putStrLn ("Error: " <> err)
@@ -584,7 +534,7 @@ replaceLR :: (ListResult -> Bool)
 replaceLR filterF list_result s =
   let oldElem = s >>= sectionListSelectedElement -- Maybe (Int, e)
       newVec  =  [(show $ lTool (head g), V.fromList g) | g <- groupBy ((==) `on` lTool ) (filter filterF list_result)]
-      newSectionList = sectionList "GHCup" newVec 0
+      newSectionList = sectionList "GHCupList" newVec 0
   in case oldElem of
       Just (_, el) -> selectBy (lTool el) (toolEqual el) newSectionList
       Nothing -> selectLatest newSectionList
@@ -801,7 +751,7 @@ brickMain s = do
   eAppData <- getAppData (Just $ ghcupInfo s)
   case eAppData of
     Right ad ->
-      defaultMain
+      Brick.defaultMain
           (app (defaultAttributes (noColor $ settings s)) (dimAttributes (noColor $ settings s)))
           (BrickState ad
                     defaultAppSettings
