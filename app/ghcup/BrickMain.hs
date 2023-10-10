@@ -235,7 +235,7 @@ sectionListSelectedElement generic_section_list = do
 
 -}
 
-type Name = String
+data Name = AllTools | Singular Tool | IODialog deriving (Eq, Ord, Show)
 
 hiddenTools :: [Tool]
 hiddenTools = [] 
@@ -270,7 +270,7 @@ makeLenses ''BrickState
 keyHandlers :: KeyBindings
             -> [ ( Vty.Key
                  , BrickSettings -> String
-                 , EventM String BrickState ()
+                 , EventM Name BrickState ()
                  )
                ]
 keyHandlers KeyBindings {..} =
@@ -311,7 +311,7 @@ showKey Vty.KUp = "↑"
 showKey Vty.KDown = "↓"
 showKey key = tail (show key)
 
-ui :: AttrMap -> BrickState -> Widget String
+ui :: AttrMap -> BrickState -> Widget Name
 ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
   = Brick.padBottom Max
       ( Brick.withBorderStyle unicode
@@ -406,14 +406,14 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
 minHSize :: Int -> Widget n -> Widget n
 minHSize s' = Brick.hLimit s' . Brick.vLimit 1 . (<+> Brick.fill ' ')
 
-app :: AttrMap -> AttrMap -> App BrickState () String
+app :: AttrMap -> AttrMap -> App BrickState () Name
 app attrs dimAttrs =
   App { appDraw     = \st -> [ui dimAttrs st]
-  , appHandleEvent  = eventHandler
-  , appStartEvent   = return ()
-  , appAttrMap      = const attrs
-  , appChooseCursor = Brick.showFirstCursor
-  }
+      , appHandleEvent  = eventHandler
+      , appStartEvent   = return ()
+      , appAttrMap      = const attrs
+      , appChooseCursor = Brick.showFirstCursor
+      }
 
 defaultAttributes :: Bool -> AttrMap
 defaultAttributes no_color = Brick.attrMap
@@ -455,7 +455,7 @@ dimAttributes no_color = Brick.attrMap
     withBackColor | no_color  = \attr _ -> attr `Vty.withStyle` Vty.reverseVideo
                   | otherwise = Vty.withBackColor
 
-eventHandler :: BrickEvent String e -> EventM String BrickState ()
+eventHandler :: BrickEvent Name e -> EventM Name BrickState ()
 eventHandler ev = do
   AppState { keyBindings = kb } <- liftIO $ readIORef settings'
   case ev of
@@ -512,8 +512,8 @@ constructList appD settings =
 -- | Focus on the tool section and the predicate which matches. If no result matches, focus on index 0
 selectBy :: Tool -> (ListResult -> Bool) -> BrickInternalState -> BrickInternalState
 selectBy tool predicate internal_state =
-  let new_focus = F.focusSetCurrent (show tool) (view sectionListFocusRingL internal_state)
-      tool_lens = sectionL (show tool) 
+  let new_focus = F.focusSetCurrent (Singular tool) (view sectionListFocusRingL internal_state)
+      tool_lens = sectionL (Singular tool) 
    in internal_state
         & sectionListFocusRingL .~ new_focus
         & tool_lens %~ L.listMoveTo 0            -- We move to 0 first
@@ -533,8 +533,8 @@ replaceLR :: (ListResult -> Bool)
           -> BrickInternalState
 replaceLR filterF list_result s =
   let oldElem = s >>= sectionListSelectedElement -- Maybe (Int, e)
-      newVec  =  [(show $ lTool (head g), V.fromList g) | g <- groupBy ((==) `on` lTool ) (filter filterF list_result)]
-      newSectionList = sectionList "GHCupList" newVec 0
+      newVec  =  [(Singular $ lTool (head g), V.fromList g) | g <- groupBy ((==) `on` lTool ) (filter filterF list_result)]
+      newSectionList = sectionList AllTools newVec 0
   in case oldElem of
       Just (_, el) -> selectBy (lTool el) (toolEqual el) newSectionList
       Nothing -> selectLatest newSectionList
