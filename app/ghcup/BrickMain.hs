@@ -25,24 +25,26 @@ import           GHCup.Prelude.Process
 import           GHCup.Prompts
 
 import Brick
-    ( BrickEvent(VtyEvent, MouseDown),
+    ( BrickEvent(VtyEvent, MouseDown, AppEvent),
       App(..),
       Padding(Max, Pad),
       AttrMap,
       EventM,
       Size(..),
       Named(..),
-      Widget(..), 
-      ViewportType (Vertical), 
+      Widget(..),
+      ViewportType (Vertical),
       (<+>),
       (<=>))
 import qualified Brick
-import           Brick.Widgets.Border ( hBorder, borderWithLabel)
+import           Brick.Widgets.Border ( hBorder, borderWithLabel, border)
 import           Brick.Widgets.Border.Style ( unicode )
-import           Brick.Widgets.Center ( center )
+import           Brick.Widgets.Center ( center, centerLayer )
 import qualified Brick.Widgets.List as L
 import           Brick.Focus (FocusRing)
 import qualified Brick.Focus as F
+import           Brick.BChan (BChan)
+import qualified Brick.BChan as BChan
 import           Codec.Archive
 import           Control.Exception.Safe
 #if !MIN_VERSION_base(4,13,0)
@@ -82,6 +84,7 @@ import           Optics.State.Operators ( (.=), (%=), (<%=))
 import           Optics.Operators ((.~), (^.), (%~))
 import           Optics.Getter (view)
 import           Optics.Lens (Lens', lens, toLensVL)
+
 
 {- Brick's widget:
 It is a FocusRing over many list's. Each list contains the information for each tool. Each list has an internal name (for Brick's runtime)
@@ -189,8 +192,8 @@ handleGenericListEvent (VtyEvent (Vty.EvKey (Vty.KChar '\t') [])) = sectionListF
 handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KBackTab []))     = sectionListFocusRingL %= F.focusPrev
 handleGenericListEvent (MouseDown _ Vty.BScrollDown _ _)          = moveDown
 handleGenericListEvent (MouseDown _ Vty.BScrollUp _ _)            = moveUp
-handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KDown []))     = moveDown
-handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KUp []))       = moveUp
+handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KDown []))        = moveDown
+handleGenericListEvent (VtyEvent (Vty.EvKey Vty.KUp []))          = moveUp
 handleGenericListEvent (VtyEvent ev) = do
     ring <- use sectionListFocusRingL
     case F.focusGetCurrent ring of
@@ -235,7 +238,14 @@ sectionListSelectedElement generic_section_list = do
 
 -}
 
-data Name = AllTools | Singular Tool | IODialog deriving (Eq, Ord, Show)
+-- | Widget names
+data Name = AllTools       -- The main list widget
+          | Singular Tool  -- The particular list for each tool
+          | IODialog       -- The pop up when installing a tool
+          deriving (Eq, Ord, Show)
+
+data Mode = Navigation | Installing deriving (Eq, Show, Ord)
+type InternalEvent = T.Text
 
 hiddenTools :: [Tool]
 hiddenTools = [] 
@@ -261,7 +271,9 @@ data BrickState = BrickState
   { _appData     :: BrickData
   , _appSettings :: BrickSettings
   , _appState    :: BrickInternalState
+  , _logState    :: [T.Text]
   , _appKeys     :: KeyBindings
+  , _mode        :: Mode
   }
   --deriving Show
 
@@ -275,10 +287,10 @@ keyHandlers :: KeyBindings
                ]
 keyHandlers KeyBindings {..} =
   [ (bQuit, const "Quit"     , Brick.halt)
-  , (bInstall, const "Install"  , withIOAction install')
-  , (bUninstall, const "Uninstall", withIOAction del')
-  , (bSet, const "Set"      , withIOAction set')
-  , (bChangelog, const "ChangeLog", withIOAction changelog')
+  , (bInstall, const "Install"  , mode .= Installing >> withIOAction install')
+  , (bUninstall, const "Uninstall", mode .= Installing >> withIOAction del')
+  , (bSet, const "Set"      , mode .= Installing >> withIOAction set')
+  , (bChangelog, const "ChangeLog", mode .= Installing >> withIOAction changelog')
   , ( bShowAllVersions
     , \BrickSettings {..} ->
        if _showAllVersions then "Don't show all versions" else "Show all versions"
@@ -406,14 +418,22 @@ ui dimAttrs BrickState{ _appSettings = as@BrickSettings{}, ..}
 minHSize :: Int -> Widget n -> Widget n
 minHSize s' = Brick.hLimit s' . Brick.vLimit 1 . (<+> Brick.fill ' ')
 
-app :: AttrMap -> AttrMap -> App BrickState () Name
+app :: AttrMap -> AttrMap -> App BrickState InternalEvent Name
 app attrs dimAttrs =
-  App { appDraw     = \st -> [ui dimAttrs st]
+  App { appDraw         = drawUI dimAttrs
       , appHandleEvent  = eventHandler
       , appStartEvent   = return ()
       , appAttrMap      = const attrs
       , appChooseCursor = Brick.showFirstCursor
       }
+
+drawUI :: AttrMap -> BrickState -> [Widget Name]
+drawUI dimAttrs st = 
+  case st ^. mode of
+    Navigation -> [ui dimAttrs st]
+    Installing ->
+      let central_log = centerLayer . border  $ foldr (flip (<=>) . Brick.txt) Brick.emptyWidget (st ^. logState)
+       in [central_log, ui dimAttrs st]
 
 defaultAttributes :: Bool -> AttrMap
 defaultAttributes no_color = Brick.attrMap
@@ -455,10 +475,13 @@ dimAttributes no_color = Brick.attrMap
     withBackColor | no_color  = \attr _ -> attr `Vty.withStyle` Vty.reverseVideo
                   | otherwise = Vty.withBackColor
 
-eventHandler :: BrickEvent Name e -> EventM Name BrickState ()
+eventHandler :: BrickEvent Name InternalEvent -> EventM Name BrickState ()
 eventHandler ev = do
   AppState { keyBindings = kb } <- liftIO $ readIORef settings'
+  m <- use mode
   case ev of
+    AppEvent line -> logState %= (line :)
+    VtyEvent (Vty.EvKey Vty.KEnter _) | m == Installing -> mode .= Navigation
     inner_event@(VtyEvent (Vty.EvKey key _)) ->
       case find (\(key', _, _) -> key' == key) (keyHandlers kb) of
         Nothing -> void $ Brick.zoom (toLensVL appState) $ handleGenericListEvent inner_event
@@ -467,25 +490,22 @@ eventHandler ev = do
 
 -- | Suspend the current UI and run an IO action in terminal. If the
 -- IO action returns a Left value, then it's thrown as userError.
-withIOAction :: (Ord n, Eq n)
-             => ( (Int, ListResult) -> ReaderT AppState IO (Either String a))
-             -> EventM n BrickState ()
+withIOAction :: ( (Int, ListResult) -> ReaderT AppState IO (Either String a)) -> EventM Name BrickState ()
 withIOAction action = do
   as <- Brick.get
   case sectionListSelectedElement (view appState as) of
     Nothing      -> pure ()
     Just (curr_ix, e) -> do
-      Brick.suspendAndResume $ do
+      newstate <- liftIO $ do
         settings <- readIORef settings'
         flip runReaderT settings $ action (curr_ix, e) >>= \case
-          Left  err -> liftIO $ putStrLn ("Error: " <> err)
-          Right _   -> liftIO $ putStrLn "Success"
+          Left  err -> logError ("Error: " <> T.pack err) >> logInfo "Press Enter to continue"
+          Right _   -> logInfo "Success" >> logInfo "Press Enter to continue"
         getAppData Nothing >>= \case
-          Right data' -> do
-            putStrLn "Press enter to continue"
-            _ <- getLine
-            pure (updateList data' as)
+          Right data' -> pure (updateList data' as)
           Left err -> throwIO $ userError err
+      Brick.put $ newstate & logState .~ []
+      Brick.invalidateCacheEntry IODialog
 
 
 -- | Update app data and list internal state based on new evidence.
@@ -496,8 +516,10 @@ updateList appD BrickState{..} =
   let newInternalState = constructList appD _appSettings (Just _appState)
   in  BrickState { _appState    = newInternalState
                  , _appData     = appD
+                 , _logState    = _logState
                  , _appSettings = _appSettings
                  , _appKeys     = _appKeys
+                 , _mode        = _mode
                  }
 
 constructList :: BrickData
@@ -746,17 +768,28 @@ settings' = unsafePerformIO $ do
 brickMain :: AppState
           -> IO ()
 brickMain s = do
-  writeIORef settings' s
+  eventChannel <- BChan.newBChan 10 
+  let new_logger = (loggerConfig s){consoleOutter = BChan.writeBChan eventChannel}
+      s' = s{loggerConfig = new_logger}
+
+  writeIORef settings' s'
 
   eAppData <- getAppData (Just $ ghcupInfo s)
   case eAppData of
-    Right ad ->
-      Brick.defaultMain
+    Right ad -> do
+      let buildVty = Vty.mkVty Vty.defaultConfig
+      initialVty <- buildVty
+      Brick.customMain 
+          initialVty
+          buildVty
+          (Just eventChannel)
           (app (defaultAttributes (noColor $ settings s)) (dimAttributes (noColor $ settings s)))
           (BrickState ad
                     defaultAppSettings
                     (constructList ad defaultAppSettings Nothing)
+                    []
                     (keyBindings (s :: AppState))
+                    Navigation
 
           )
         $> ()
