@@ -56,11 +56,23 @@ RUN ghcup --verbose install ghc   --isolate=/usr     --force ${GHC} && \
 # 	rm -rf /tmp/ghcup* && \
 # 	ghcup gc -p -s -c -t
 
+# ghc dependencies
+RUN apt-get install -y \
+            autoconf \
+            automake \
+            python3 \
+            libnuma-dev \
+            python3-sphinx \
+            texlive-xetex \
+            texlive-fonts-recommended \
+            fonts-lmodern \
+            texlive-latex-extra
+
 COPY . /usr/local/ghcup-hs
 
 WORKDIR /usr/local/ghcup-hs
-RUN cabal update \
-    && cabal build --only-dependencies all --project-file=cabal.advance-options.project
+# RUN cabal update \
+#     && cabal build --only-dependencies all --project-file=cabal.advance-options.project
 
 # Any additional commands
 CMD ["bash"]
